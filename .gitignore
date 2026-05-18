@@ -13,3 +13,6 @@
 .claude/scheduled_tasks.json
 # END swamp managed section
 /.agent-shell/
+/vaults/
+/cloud-init-elastic-dev.yaml
+/models/

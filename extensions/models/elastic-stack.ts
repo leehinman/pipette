@@ -139,6 +139,10 @@ const StackStateSchema = z.object({
   httpsCertFingerprint: z.string().optional().describe(
     "SHA-256 fingerprint of the Elasticsearch HTTP CA (hex, no colons).",
   ),
+  caCertB64: z.string().optional().describe(
+    "Base64-encoded Elasticsearch HTTP CA certificate (http_ca.crt). " +
+    "Referenced by elastic-agent models via CEL to enroll agents.",
+  ),
   syncedAt: z.string(),
 });
 
@@ -212,13 +216,20 @@ async function fetchStackState(
     probeService(fleetHost, user, keyPath, installDir, "elastic-agent", "fleet-server.pid"),
   ]);
 
-  // Try to get the cert fingerprint from the ES host if ES is installed
+  // Try to get the cert fingerprint and CA cert from the ES host if installed
   let fingerprint: string | undefined;
+  let caCertB64: string | undefined;
   if (esStatus.installed) {
-    const fp = await sshExec(esHost, user, keyPath,
-      `openssl x509 -fingerprint -sha256 -noout -in "${installDir}/elasticsearch/config/certs/http_ca.crt" 2>/dev/null | sed 's/.*=//;s/://g' || echo ""`
-    );
+    const [fp, ca] = await Promise.all([
+      sshExec(esHost, user, keyPath,
+        `openssl x509 -fingerprint -sha256 -noout -in "${installDir}/elasticsearch/config/certs/http_ca.crt" 2>/dev/null | sed 's/.*=//;s/://g' || echo ""`
+      ),
+      sshExec(esHost, user, keyPath,
+        `base64 -w 0 "${installDir}/elasticsearch/config/certs/http_ca.crt" 2>/dev/null || echo ""`
+      ),
+    ]);
     fingerprint = fp.stdout || undefined;
+    caCertB64 = ca.stdout || undefined;
   }
 
   return {
@@ -231,6 +242,7 @@ async function fetchStackState(
     kibanaUrl: `https://${kibanaHost}:5601`,
     fleetServerUrl: `https://${fleetHost}:8220`,
     httpsCertFingerprint: fingerprint,
+    caCertB64,
     syncedAt: new Date().toISOString(),
   };
 }
@@ -686,7 +698,7 @@ fi
 
 export const model = {
   type: "@leeehinman/elastic-stack",
-  version: "2026.05.18.12",
+  version: "2026.05.18.13",
   globalArguments: GlobalArgsSchema,
   resources: {
     state: {
