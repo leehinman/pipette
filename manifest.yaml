@@ -1,0 +1,23 @@
+manifestVersion: 1
+name: "@leeehinman/elastic-stack"
+version: "2026.05.18.1"
+description: >
+  Installs and manages the Elastic Stack (Elasticsearch, Kibana, Fleet Server)
+  on any SSH-reachable Linux host using official tar.gz archives.
+  TLS is auto-configured, and all credentials are stored in the swamp vault.
+  Supports any VM provider (multipass, AWS, GCP, vagrant) via SSH.
+repository: "https://github.com/leeehinman/pipette"
+models:
+  - elastic-stack.ts
+platforms:
+  - darwin-aarch64
+  - darwin-x86_64
+  - linux-x86_64
+  - linux-aarch64
+labels:
+  - elasticsearch
+  - kibana
+  - fleet-server
+  - elastic-stack
+  - observability
+  - security

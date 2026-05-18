@@ -1,0 +1,100 @@
+id: 15326648-eae4-43fe-a01b-170c6e43b4bc
+name: elastic-stack-provision
+description: >
+  Provision three multipass VMs (one per service) and install the Elastic Stack
+  across them: Elasticsearch, Kibana, and Fleet Server. Uses aarch64 tar.gz
+  archives. TLS is auto-configured; the CA cert is distributed from the ES host
+  to the other two. All credentials are stored in the swamp vault.
+  Set sshKey to the path of a private key file, or leave empty to use the SSH
+  agent (e.g. YubiKey via ssh-agent).
+tags: {}
+version: 1
+inputs:
+  properties:
+    sshKey:
+      type: string
+      default: ""
+      description: >
+        Absolute path to the SSH private key file. Leave empty to authenticate
+        via the SSH agent (required for hardware keys such as YubiKey).
+jobs:
+  - name: provision-vms
+    description: >
+      Launch all three VMs in parallel. Each gets 2 CPUs, 4G RAM, 20G disk —
+      sized for a single service. Ubuntu 24.04 (noble) for arm64 support.
+    steps:
+      - name: launch-es
+        description: Launch the Elasticsearch VM
+        task:
+          type: model_method
+          modelIdOrName: elastic-es
+          methodName: launch
+          inputs:
+            image: "24.04"
+            cpus: 2
+            memory: 4G
+            disk: 20G
+            cloudInit: /Users/hinman/src/pipette/cloud-init-elastic-dev.yaml
+        dependsOn: []
+        allowFailure: false
+
+      - name: launch-kibana
+        description: Launch the Kibana VM
+        task:
+          type: model_method
+          modelIdOrName: elastic-kibana
+          methodName: launch
+          inputs:
+            image: "24.04"
+            cpus: 2
+            memory: 4G
+            disk: 20G
+            cloudInit: /Users/hinman/src/pipette/cloud-init-elastic-dev.yaml
+        dependsOn: []
+        allowFailure: false
+
+      - name: launch-fleet
+        description: Launch the Fleet Server VM
+        task:
+          type: model_method
+          modelIdOrName: elastic-fleet
+          methodName: launch
+          inputs:
+            image: "24.04"
+            cpus: 2
+            memory: 4G
+            disk: 20G
+            cloudInit: /Users/hinman/src/pipette/cloud-init-elastic-dev.yaml
+        dependsOn: []
+        allowFailure: false
+    dependsOn: []
+
+  - name: install-elastic-stack
+    description: >
+      Install the Elastic Stack across the three VMs. Host IPs are resolved from
+      the multipass instance data written by the provision-vms job. The sshKey
+      workflow input is forwarded to the model.
+    steps:
+      - name: install
+        description: Orchestrate ES → CA cert distribution → Kibana → Fleet Server install
+        task:
+          type: model_method
+          modelType: "@leeehinman/elastic-stack"
+          modelName: elastic-stack-dev
+          methodName: install
+          inputs:
+            name: elastic-stack-dev
+            elasticsearchHost: ${{ data.latest("elastic-es", "elastic-es").attributes.ipv4[0] }}
+            kibanaHost: ${{ data.latest("elastic-kibana", "elastic-kibana").attributes.ipv4[0] }}
+            fleetServerHost: ${{ data.latest("elastic-fleet", "elastic-fleet").attributes.ipv4[0] }}
+            version: "9.4.1"
+            sshUser: ubuntu
+            sshKey: ${{ inputs.sshKey }}
+            installDir: /opt/elastic
+            arch: aarch64
+        dependsOn: []
+        allowFailure: false
+    dependsOn:
+      - job: provision-vms
+        condition:
+          type: succeeded
