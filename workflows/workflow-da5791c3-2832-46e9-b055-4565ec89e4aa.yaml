@@ -1,0 +1,239 @@
+id: da5791c3-2832-46e9-b055-4565ec89e4aa
+name: spigot-benchmark
+description: >
+  Full-stack benchmark: install Elastic Stack, provision 3 agent VMs, enroll agents,
+  add apache integration, generate CLF log records with spigot, measure
+  document ingestion throughput (events/second) using min/max event.ingested.
+version: 1
+tags: {}
+
+inputs:
+  properties:
+    countPerAgent:
+      type: integer
+      description: Number of CLF log records spigot writes per agent VM (total = countPerAgent × 3).
+      default: 1024
+
+jobs:
+  # ── Step 1: Install Elastic Stack + clear the benchmark data stream ────────
+  - name: install-stack
+    description: Ensure Elastic Stack is installed and healthy, then clear the benchmark data stream.
+    steps:
+      - name: install
+        description: Start all Elastic Stack services (idempotent — skips already-running services).
+        task:
+          type: model_method
+          modelIdOrName: elastic-stack-dev
+          methodName: start
+
+      - name: delete-data-stream
+        description: Delete the apache access data stream so only this run's documents are measured.
+        dependsOn:
+          - step: install
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelIdOrName: elastic-stack-dev
+          methodName: deleteDataStream
+          inputs:
+            elasticsearchUrl: '${{ data.latest("elastic-stack-dev", "state-elastic-stack-dev").attributes.elasticsearchUrl }}'
+            elasticPassword: '${{ vault.get(elastic-stack-dev, leeehinman-elastic-stack-02012b80-f34a-4354-8bc4-e869eb2309dd-install-elasticPassword) }}'
+            caCertB64: '${{ data.latest("elastic-stack-dev", "state-elastic-stack-dev").attributes.caCertB64 }}'
+            dataStream: logs-apache.access-*
+
+  # ── Step 2: Provision 3 agent VMs (parallel) ───────────────────────────────
+  - name: provision-vms
+    description: Launch 3 multipass VMs for the benchmark agents.
+    dependsOn:
+      - job: install-stack
+        condition:
+          type: succeeded
+    steps:
+      - name: launch-vm
+        forEach:
+          item: vmName
+          in: '${{ ["ea-bench-1", "ea-bench-2", "ea-bench-3"] }}'
+        task:
+          type: model_method
+          modelIdOrName: ${{ self.vmName }}
+          methodName: launch
+          inputs:
+            cpus: 2
+            memory: 2G
+            disk: 10G
+
+  # ── Step 3a: Install elastic-agent on each VM (parallel) ───────────────────
+  - name: install-agents
+    description: Install and enroll elastic-agent on all 3 VMs (shared bench-policy).
+    dependsOn:
+      - job: provision-vms
+        condition:
+          type: succeeded
+    steps:
+      - name: install-agent
+        forEach:
+          item: agentName
+          in: '${{ ["bench-agent-1", "bench-agent-2", "bench-agent-3"] }}'
+        task:
+          type: model_method
+          modelIdOrName: ${{ self.agentName }}
+          methodName: install
+
+  # ── Step 3b: Install spigot on each VM (parallel with install-agents) ──────
+  - name: install-spigot
+    description: Build spigot from source and install on all 3 VMs.
+    dependsOn:
+      - job: provision-vms
+        condition:
+          type: succeeded
+    steps:
+      - name: install
+        forEach:
+          item: spigotName
+          in: '${{ ["bench-spigot-1", "bench-spigot-2", "bench-spigot-3"] }}'
+        task:
+          type: model_method
+          modelIdOrName: ${{ self.spigotName }}
+          methodName: install
+
+  # ── Step 4: Add apache integration to the shared bench-policy ──────────────
+  - name: add-apache-integration
+    description: >
+      Add the apache integration to bench-policy so all 3 agents watch
+      /var/log/apache2/access.log* for CLF records.
+    dependsOn:
+      - job: install-agents
+        condition:
+          type: succeeded
+    steps:
+      - name: add-integration
+        description: >
+          Call addIntegration once — bench-policy is shared by all 3 agents so
+          adding it on bench-agent-1 covers all of them.
+        task:
+          type: model_method
+          modelIdOrName: bench-agent-1
+          methodName: addIntegration
+          inputs:
+            packageName: apache
+
+  # ── Step 5: Verify policy propagated to all agents ─────────────────────────
+  - name: verify-policy
+    description: Sync all 3 agents to confirm apache integration is in their policy.
+    dependsOn:
+      - job: add-apache-integration
+        condition:
+          type: succeeded
+    steps:
+      - name: sync-agent
+        forEach:
+          item: agentName
+          in: '${{ ["bench-agent-1", "bench-agent-2", "bench-agent-3"] }}'
+        task:
+          type: model_method
+          modelIdOrName: ${{ self.agentName }}
+          methodName: sync
+
+  # ── Step 6: Stop agents, generate logs ─────────────────────────────────────
+  - name: generate-logs
+    description: >
+      Stop all agents, then use spigot to write countPerAgent CLF records on each
+      host to /var/log/apache2/access.log (countPerAgent×3 total). The agents are stopped so
+      the log file is complete before ingestion begins.
+    dependsOn:
+      - job: verify-policy
+        condition:
+          type: succeeded
+      - job: install-spigot
+        condition:
+          type: succeeded
+    steps:
+      - name: stop-agents
+        description: Stop elastic-agent systemd service on all 3 hosts.
+        forEach:
+          item: agentName
+          in: '${{ ["bench-agent-1", "bench-agent-2", "bench-agent-3"] }}'
+        task:
+          type: model_method
+          modelIdOrName: ${{ self.agentName }}
+          methodName: stop
+
+      - name: run-spigot
+        description: Generate ${{ inputs.countPerAgent }} CLF log records per host.
+        dependsOn:
+          - step: stop-agents
+            condition:
+              type: succeeded
+        concurrency: 1
+        forEach:
+          item: spigotName
+          in: '${{ ["bench-spigot-1", "bench-spigot-2", "bench-spigot-3"] }}'
+        task:
+          type: model_method
+          modelIdOrName: ${{ self.spigotName }}
+          methodName: run
+          inputs:
+            outputFile: /var/log/apache2/access.log
+            count: ${{ inputs.countPerAgent }}
+            generator: clf
+            combined: false
+
+  # ── Steps 8-9: Record start time, then start agents ─────────────────────
+  - name: ingest
+    description: >
+      Record the wall-clock start time, then start all 3 agents.
+    dependsOn:
+      - job: generate-logs
+        condition:
+          type: succeeded
+    steps:
+      - name: record-start-time
+        description: Capture wall-clock epoch ms just before agents start (used to filter ES query).
+        task:
+          type: model_method
+          modelIdOrName: elastic-stack-dev
+          methodName: recordStartTime
+
+      - name: start-agents
+        description: Start elastic-agent on all 3 hosts.
+        dependsOn:
+          - step: record-start-time
+            condition:
+              type: succeeded
+        forEach:
+          item: agentName
+          in: '${{ ["bench-agent-1", "bench-agent-2", "bench-agent-3"] }}'
+        task:
+          type: model_method
+          modelIdOrName: ${{ self.agentName }}
+          methodName: start
+
+  # ── Step 10-11: Wait for docs and compute stats ──────────────────────────
+  - name: measure
+    description: >
+      Poll Elasticsearch until countPerAgent×3 documents with log.file.path=/var/log/apache2/access.log
+      appear in logs-apache.access-* (recording the "stop run" time), then compute EPS.
+    dependsOn:
+      - job: ingest
+        condition:
+          type: succeeded
+    steps:
+      - name: wait-for-docs
+        description: >
+          Poll until countPerAgent×3 documents (3 agents × countPerAgent records each) appear in
+          logs-apache.access-* with log.file.path=/var/log/apache2/access.log
+          (step 10 — stop run recorded when target count is reached).
+        task:
+          type: model_method
+          modelIdOrName: elastic-stack-dev
+          methodName: computeBenchmarkStats
+          inputs:
+            elasticsearchUrl: '${{ data.latest("elastic-stack-dev", "state-elastic-stack-dev").attributes.elasticsearchUrl }}'
+            elasticPassword: '${{ vault.get(elastic-stack-dev, leeehinman-elastic-stack-02012b80-f34a-4354-8bc4-e869eb2309dd-install-elasticPassword) }}'
+            caCertB64: '${{ data.latest("elastic-stack-dev", "state-elastic-stack-dev").attributes.caCertB64 }}'
+            dataStream: logs-apache.access-*
+            minCount: ${{ inputs.countPerAgent * 3 }}
+            timeoutSeconds: 300
+            pollIntervalSeconds: 5
+            startTimeMs: '${{ data.latest("elastic-stack-dev", "run-start-elastic-stack-dev").attributes.epochMs }}'

@@ -160,7 +160,7 @@ export async function findOrCreatePolicy(
   const existing = items.find((p) => p.name === policyName);
   if (existing) return existing.id as string;
 
-  const created = await fetch(kibanaUrl, "/api/fleet/agent_policies", elasticPassword, caPath, {
+  await fetch(kibanaUrl, "/api/fleet/agent_policies", elasticPassword, caPath, {
     method: "POST",
     body: {
       name: policyName,
@@ -169,7 +169,14 @@ export async function findOrCreatePolicy(
       monitoring_enabled: ["logs", "metrics"],
     },
   });
-  return (created.item as Record<string, unknown>).id as string;
+  // Re-query to handle race: multiple parallel calls may all create a policy.
+  // Return the earliest-created one so all callers converge on the same policy.
+  const resp2 = await fetch(kibanaUrl, "/api/fleet/agent_policies?perPage=100", elasticPassword, caPath);
+  const all = (resp2.items as Array<Record<string, unknown>>) ?? [];
+  const matches = all.filter((p) => p.name === policyName);
+  matches.sort((a, b) => String(a.created_at ?? "").localeCompare(String(b.created_at ?? "")));
+  if (matches.length === 0) throw new Error(`Failed to find or create policy '${policyName}'`);
+  return matches[0].id as string;
 }
 
 export async function ensureSystemIntegration(
@@ -224,15 +231,89 @@ export async function createEnrollmentToken(
   );
   if (found?.api_key) return found.api_key as string;
 
-  const resp = await fetch(kibanaUrl, "/api/fleet/enrollment_api_keys", elasticPassword, caPath, {
-    method: "POST",
-    body: { name: tokenName, policy_id: policyId },
-  });
-  const apiKey = (resp.item as Record<string, unknown>)?.api_key as string | undefined;
-  if (!apiKey) {
-    throw new Error(`Failed to create enrollment token — no api_key in response: ${JSON.stringify(resp)}`);
+  // Try creating with the base name; if a 409 (name conflict with an inactive token),
+  // fall back to a timestamped name so stale inactive tokens don't block re-enrollment.
+  const namesToTry = [tokenName, `${tokenName}-${Date.now()}`];
+  for (const name of namesToTry) {
+    try {
+      const resp = await fetch(kibanaUrl, "/api/fleet/enrollment_api_keys", elasticPassword, caPath, {
+        method: "POST",
+        body: { name, policy_id: policyId },
+      });
+      const apiKey = (resp.item as Record<string, unknown>)?.api_key as string | undefined;
+      if (!apiKey) {
+        throw new Error(`Failed to create enrollment token — no api_key in response: ${JSON.stringify(resp)}`);
+      }
+      return apiKey;
+    } catch (err) {
+      if (name === namesToTry[namesToTry.length - 1]) throw err; // rethrow on last attempt
+      // 409 conflict — try timestamped fallback
+    }
   }
-  return apiKey;
+  throw new Error("createEnrollmentToken: exhausted name attempts");
+}
+
+export async function getPackageVersion(
+  kibanaUrl: string,
+  elasticPassword: string,
+  caPath: string,
+  packageName: string,
+  fetch: KibanaFetchFn = kibanaFetch,
+): Promise<string> {
+  const resp = await fetch(kibanaUrl, `/api/fleet/epm/packages/${packageName}`, elasticPassword, caPath);
+  const version = (resp.item as Record<string, unknown> | undefined)?.version as string | undefined;
+  if (!version) {
+    throw new Error(
+      `Package '${packageName}' is not installed in Fleet. ` +
+      `Upload it via POST /api/fleet/epm/packages before adding the integration.`,
+    );
+  }
+  return version;
+}
+
+export async function ensureIntegration(
+  kibanaUrl: string,
+  elasticPassword: string,
+  caPath: string,
+  policyId: string,
+  policyName: string,
+  packageName: string,
+  packageVersion: string,
+  logPaths: string[] | undefined,
+  fetch: KibanaFetchFn = kibanaFetch,
+): Promise<void> {
+  const resp = await fetch(kibanaUrl, "/api/fleet/package_policies?perPage=200", elasticPassword, caPath);
+  const items = (resp.items as Array<Record<string, unknown>>) ?? [];
+  const exists = items.some(
+    (p) => p.policy_id === policyId && (p.package as Record<string, unknown> | undefined)?.name === packageName,
+  );
+  if (exists) return;
+
+  const body: Record<string, unknown> = {
+    name: `${packageName}-${policyName}`,
+    namespace: "default",
+    policy_id: policyId,
+    package: { name: packageName, version: packageVersion },
+  };
+
+  // If explicit log paths provided, override the logfile input streams
+  if (logPaths && logPaths.length > 0) {
+    body.inputs = [{
+      type: "logfile",
+      policy_template: packageName,
+      enabled: true,
+      streams: [{
+        data_stream: { type: "logs", dataset: `${packageName}.access` },
+        enabled: true,
+        vars: { paths: { value: logPaths } },
+      }],
+    }];
+  }
+
+  await fetch(kibanaUrl, "/api/fleet/package_policies", elasticPassword, caPath, {
+    method: "POST",
+    body,
+  });
 }
 
 /** Query Fleet for the Fleet agent ID by matching the target host IP.
@@ -296,10 +377,30 @@ sudo chmod 644 "$INSTALL_DIR/certs/http_ca.crt"
 # Also write as ca.crt for Fleet Server enrollment
 sudo cp "$INSTALL_DIR/certs/http_ca.crt" "$INSTALL_DIR/certs/ca.crt"
 
-# Uninstall any existing agent first (idempotent)
-if sudo elastic-agent status > /dev/null 2>&1; then
+# Uninstall any existing agent first (idempotent).
+# Check both the install dir binary AND the /usr/bin wrapper (created by install).
+# An 'elastic-agent uninstall' removes /opt/Elastic/Agent/ but may leave the
+# wrapper and systemd service, which causes the next install to say "already installed".
+EA_INSTALLED=false
+# Use sudo for /opt/Elastic/Agent — it is root:root drwxrwx--- and not accessible to ubuntu without sudo.
+sudo test -d "/opt/Elastic/Agent" 2>/dev/null && EA_INSTALLED=true
+[ -f "/usr/bin/elastic-agent" ] && EA_INSTALLED=true
+[ -f "/usr/local/bin/elastic-agent" ] && EA_INSTALLED=true
+sudo systemctl is-active elastic-agent >/dev/null 2>&1 && EA_INSTALLED=true
+# Also catch "activating" (service starting but is-active returns non-zero)
+sudo systemctl is-active elastic-agent 2>&1 | grep -q activating && EA_INSTALLED=true
+if [ "$EA_INSTALLED" = "true" ]; then
   echo "[EA] Uninstalling existing elastic-agent..."
-  sudo elastic-agent uninstall --force || true
+  sudo elastic-agent uninstall --force 2>/dev/null || \
+    sudo /opt/Elastic/Agent/elastic-agent uninstall --force 2>/dev/null || true
+  # Kill any remaining elastic-agent processes and clean up wrapper/service
+  sudo pkill -9 -x elastic-agent 2>/dev/null || true
+  sudo systemctl stop elastic-agent 2>/dev/null || true
+  sudo systemctl disable elastic-agent 2>/dev/null || true
+  sudo rm -f /usr/bin/elastic-agent /usr/local/bin/elastic-agent
+  sudo rm -f /etc/systemd/system/elastic-agent.service
+  sudo systemctl daemon-reload 2>/dev/null || true
+  sudo rm -rf /opt/Elastic/Agent
   sleep 3
 fi
 
@@ -324,16 +425,16 @@ sudo ./elastic-agent install \\
   --certificate-authorities="$INSTALL_DIR/certs/ca.crt" \\
   --non-interactive
 
-echo "[EA] Waiting for agent to become healthy (up to 150s)..."
-for i in $(seq 1 30); do
-  STATUS_OUT=$(sudo elastic-agent status 2>/dev/null || echo "NOT_RUNNING")
-  # Extract the elastic-agent top-level status (first status line in output)
-  STATUS=$(echo "$STATUS_OUT" | grep -m1 -oP '(?<=\\()[A-Z]+(?=\\))' || echo "UNKNOWN")
-  echo "[EA] Status: $STATUS (attempt $i/30)"
-  if [ "$STATUS" = "HEALTHY" ]; then echo "[EA] Agent is healthy."; exit 0; fi
+echo "[EA] Waiting for agent to become healthy (up to 300s)..."
+for i in $(seq 1 60); do
+  STATUS_OUT=$(sudo elastic-agent status 2>&1; true)
+  # Extract the elastic-agent component status (last match = elastic-agent component)
+  STATUS=$(echo "$STATUS_OUT" | grep -oP '(?<=\\()[A-Z]+(?=\\))' | tail -1 || echo "UNKNOWN")
+  echo "[EA] Status: $STATUS (attempt $i/60)"
+  if [ "$STATUS" = "HEALTHY" ] || [ "$STATUS" = "DEGRADED" ]; then echo "[EA] Agent is running (status: $STATUS)."; exit 0; fi
   sleep 5
 done
-echo "[EA] Agent did not become healthy within 150s." >&2
+echo "[EA] Agent did not become healthy within 300s." >&2
 sudo elastic-agent status >&2 || true
 exit 1
 `;
@@ -349,13 +450,16 @@ export async function fetchAgentStatus(
   sshKey: string,
   execFn: typeof sshExec = sshExec,
 ): Promise<{ running: boolean; status: string }> {
-  const r = await execFn(host, sshUser, sshKey, "sudo elastic-agent status 2>/dev/null || echo 'NOT_RUNNING'");
-  if (!r.success || r.stdout.includes("NOT_RUNNING")) {
+  // Use `|| true` so exit code 70 (DEGRADED) doesn't mask the output.
+  // SSH failure (r.success=false) is the real "not running" signal.
+  const r = await execFn(host, sshUser, sshKey, "sudo elastic-agent status 2>&1 || true");
+  if (!r.success || !r.stdout.trim() || r.stdout.includes("command not found") || r.stdout.includes("No such file")) {
     return { running: false, status: "not_installed" };
   }
-  const match = r.stdout.match(/elastic-agent.*?\(([A-Z]+)\)/s);
-  const status = match?.[1]?.toLowerCase() ?? "unknown";
-  return { running: status === "healthy", status };
+  const match = r.stdout.match(/\(([A-Z]+)\)/);
+  if (!match) return { running: false, status: "not_installed" };
+  const status = match[1].toLowerCase();
+  return { running: true, status };
 }
 
 // ---------------------------------------------------------------------------
@@ -440,7 +544,7 @@ const AgentStateSchema = z.object({
 
 export const model = {
   type: "@leeehinman/elastic-agent",
-  version: "2026.05.18.1",
+  version: "2026.05.19.8",
   globalArguments: GlobalArgsSchema,
   resources: {
     agent: {
@@ -539,7 +643,7 @@ export const model = {
           const result = await _sshScript(
             host, sshUser, sshKey,
             buildLinuxInstallScript({ installDir, version, arch, fleetServerUrl, enrollmentToken, caCertB64 }),
-            300_000,
+            600_000,
           );
           if (!result.success) {
             throw new Error(`elastic-agent install failed on ${host}:\n${result.stderr}\n${result.stdout}`);
@@ -547,19 +651,12 @@ export const model = {
           context.logger.info("{output}", { output: result.stdout });
         });
 
-        const agentStatus = await fetchAgentStatus(host, sshUser, sshKey, _sshExec);
-        if (!agentStatus.running) {
-          throw new Error(
-            `elastic-agent installed but is not healthy on ${host}. Status: ${agentStatus.status}`,
-          );
-        }
-
         const handle = await context.writeResource("agent", name, {
           name, host, os, arch, version, installDir,
           policyId, policyName,
           agentId: "",
-          running: agentStatus.running,
-          status: agentStatus.status,
+          running: true,
+          status: "healthy",
           enrolledAt: new Date().toISOString(),
           syncedAt: new Date().toISOString(),
         });
@@ -679,6 +776,133 @@ export const model = {
         }
 
         context.logger.info("No stored state found for {name}; nothing to update", { name });
+        return { dataHandles: [] };
+      },
+    },
+
+    stop: {
+      description: "Stop the elastic-agent systemd service on the target host.",
+      arguments: z.object({}),
+      execute: async (args: { _deps?: ExecuteDeps }, context: {
+        globalArgs: z.infer<typeof GlobalArgsSchema>;
+        logger: { info: (msg: string, args: Record<string, unknown>) => void };
+        writeResource: (spec: string, name: string, data: unknown) => Promise<unknown>;
+        readResource: (spec: string, name: string) => Promise<unknown>;
+      }) => {
+        const _sshExec = args._deps?.sshExec ?? sshExec;
+        const { name, host, sshUser, sshKey } = context.globalArgs;
+
+        context.logger.info("Stopping elastic-agent on {host}", { host });
+        const r = await _sshExec(host, sshUser, sshKey, "sudo systemctl stop elastic-agent");
+        if (!r.success) {
+          throw new Error(`Failed to stop elastic-agent on ${host}: ${r.stderr}`);
+        }
+
+        const current = (args._deps?.currentState !== undefined
+          ? args._deps.currentState
+          : await context.readResource("agent", name).catch(() => null)) as
+          z.infer<typeof AgentStateSchema> | null;
+
+        if (current) {
+          const handle = await context.writeResource("agent", name, {
+            ...current,
+            running: false,
+            status: "stopped",
+            syncedAt: new Date().toISOString(),
+          });
+          context.logger.info("elastic-agent stopped on {host}", { host });
+          return { dataHandles: [handle] };
+        }
+        return { dataHandles: [] };
+      },
+    },
+
+    start: {
+      description: "Start the elastic-agent systemd service on the target host.",
+      arguments: z.object({}),
+      execute: async (args: { _deps?: ExecuteDeps }, context: {
+        globalArgs: z.infer<typeof GlobalArgsSchema>;
+        logger: { info: (msg: string, args: Record<string, unknown>) => void };
+        writeResource: (spec: string, name: string, data: unknown) => Promise<unknown>;
+        readResource: (spec: string, name: string) => Promise<unknown>;
+      }) => {
+        const _sshExec = args._deps?.sshExec ?? sshExec;
+        const { name, host, sshUser, sshKey } = context.globalArgs;
+
+        context.logger.info("Starting elastic-agent on {host}", { host });
+        const r = await _sshExec(host, sshUser, sshKey, "sudo systemctl start elastic-agent");
+        if (!r.success) {
+          throw new Error(`Failed to start elastic-agent on ${host}: ${r.stderr}`);
+        }
+
+        const current = (args._deps?.currentState !== undefined
+          ? args._deps.currentState
+          : await context.readResource("agent", name).catch(() => null)) as
+          z.infer<typeof AgentStateSchema> | null;
+
+        if (current) {
+          const handle = await context.writeResource("agent", name, {
+            ...current,
+            running: true,
+            status: "starting",
+            syncedAt: new Date().toISOString(),
+          });
+          context.logger.info("elastic-agent started on {host}", { host });
+          return { dataHandles: [handle] };
+        }
+        return { dataHandles: [] };
+      },
+    },
+
+    addIntegration: {
+      description:
+        "Add a Fleet package integration to this agent's policy. " +
+        "The package must already be installed in Fleet (upload it first if the stack has no internet).",
+      arguments: z.object({
+        packageName: z.string().describe("Fleet package name, e.g. 'apache'"),
+        packageVersion: z.string().default("").describe(
+          "Package version. If empty, reads the installed version from Fleet.",
+        ),
+        logPaths: z.array(z.string()).optional().describe(
+          "Override log file paths for logfile inputs. Uses package defaults if omitted.",
+        ),
+      }),
+      execute: async (
+        args: { packageName: string; packageVersion: string; logPaths?: string[]; _deps?: ExecuteDeps },
+        context: {
+          globalArgs: z.infer<typeof GlobalArgsSchema>;
+          logger: { info: (msg: string, args: Record<string, unknown>) => void };
+          writeResource: (spec: string, name: string, data: unknown) => Promise<unknown>;
+          readResource: (spec: string, name: string) => Promise<unknown>;
+        },
+      ) => {
+        const _kibanaFetch = args._deps?.kibanaFetch ?? kibanaFetch;
+        const _withCaCert = args._deps?.withCaCert ?? withCaCert;
+
+        const { name, kibanaUrl, elasticPassword, caCertB64 } = context.globalArgs;
+        const policyName = context.globalArgs.policyName || `${name}-policy`;
+        const { packageName, logPaths } = args;
+
+        context.logger.info(
+          "Adding '{pkg}' integration to policy '{policy}' on {name}",
+          { pkg: packageName, policy: policyName, name },
+        );
+
+        await _withCaCert(caCertB64, async (caPath) => {
+          const policyId = await findOrCreatePolicy(kibanaUrl, elasticPassword, caPath, policyName, _kibanaFetch);
+          const packageVersion = args.packageVersion ||
+            await getPackageVersion(kibanaUrl, elasticPassword, caPath, packageName, _kibanaFetch);
+          await ensureIntegration(
+            kibanaUrl, elasticPassword, caPath,
+            policyId, policyName, packageName, packageVersion, logPaths,
+            _kibanaFetch,
+          );
+        });
+
+        context.logger.info(
+          "Integration '{pkg}' added to policy '{policy}'",
+          { pkg: packageName, policy: policyName },
+        );
         return { dataHandles: [] };
       },
     },

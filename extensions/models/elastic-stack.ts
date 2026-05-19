@@ -72,6 +72,52 @@ async function sshScript(
 }
 
 // ---------------------------------------------------------------------------
+// Elasticsearch HTTP helpers (used by benchmark methods)
+// ---------------------------------------------------------------------------
+
+async function withCaCert<T>(
+  caCertB64: string,
+  fn: (caPath: string) => Promise<T>,
+): Promise<T> {
+  const caPath = `/tmp/es-ca-${Date.now()}.crt`;
+  const caBytes = Uint8Array.from(atob(caCertB64), (c) => c.charCodeAt(0));
+  await Deno.writeFile(caPath, caBytes);
+  try {
+    return await fn(caPath);
+  } finally {
+    await Deno.remove(caPath).catch(() => {});
+  }
+}
+
+async function esFetch(
+  esUrl: string,
+  path: string,
+  elasticPassword: string,
+  caPath: string,
+  body?: unknown,
+  method?: string,
+): Promise<Record<string, unknown>> {
+  const args = [
+    "-s", "--cacert", caPath,
+    "-u", `elastic:${elasticPassword}`,
+    "-H", "Content-Type: application/json",
+    ...(body ? ["-d", JSON.stringify(body)] : []),
+    "-X", method ?? (body ? "POST" : "GET"),
+    `${esUrl}${path}`,
+  ];
+  const out = await new Deno.Command("curl", { args, stdout: "piped", stderr: "piped" }).output();
+  if (!out.success) {
+    throw new Error(`ES ${path} failed: ${new TextDecoder().decode(out.stderr)}`);
+  }
+  const text = new TextDecoder().decode(out.stdout);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`ES ${path} returned non-JSON: ${text.slice(0, 300)}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Credential generation
 // ---------------------------------------------------------------------------
 
@@ -159,6 +205,25 @@ const CredentialsSchema = z.object({
   fleetServiceToken: z.string().meta({ sensitive: true }).describe(
     "Fleet Server service token (elastic/fleet-server).",
   ),
+});
+
+const BenchmarkResultSchema = z.object({
+  dataStream: z.string(),
+  logFilePath: z.string(),
+  documentCount: z.number(),
+  minIngestedMs: z.number().describe("min event.ingested as epoch milliseconds"),
+  maxIngestedMs: z.number().describe("max event.ingested as epoch milliseconds"),
+  ingestDurationSeconds: z.number().describe("(max - min event.ingested) in seconds"),
+  eventsPerSecond: z.number().describe("documentCount / ingestDurationSeconds"),
+  wallDurationSeconds: z.number().describe("Wall-clock time from poll start to completion"),
+  runStartAt: z.string().optional().describe("Wall-clock time agents were started (from recordStartTime)"),
+  startAt: z.string(),
+  stopAt: z.string(),
+  ranAt: z.string(),
+});
+
+const RunStartTimeSchema = z.object({
+  epochMs: z.number().describe("Epoch milliseconds when agents were started"),
 });
 
 type StackState = z.infer<typeof StackStateSchema>;
@@ -642,13 +707,18 @@ function buildKibanaStartScript(installDir: string): string {
   return `
 set -euo pipefail
 KN_HOME="${installDir}/kibana"
-if [ ! -f "$KN_HOME/kibana.pid" ] || \
-   ! kill -0 "$(cat "$KN_HOME/kibana.pid" 2>/dev/null)" 2>/dev/null; then
+# Check HTTP endpoint first — the PID file tracks the shell-wrapper PID, not the
+# actual Node.js process, so kill -0 gives false negatives after the wrapper exits.
+HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" "https://localhost:5601/api/status" 2>/dev/null || echo "000")
+if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "401" ]; then
+  echo "Kibana already running (HTTP $HTTP_CODE)."
+elif [ -f "$KN_HOME/kibana.pid" ] && kill -0 "$(cat "$KN_HOME/kibana.pid" 2>/dev/null)" 2>/dev/null; then
+  echo "Kibana already running (pid $(cat "$KN_HOME/kibana.pid"))."
+else
   echo "Starting Kibana..."
+  rm -f "$KN_HOME/kibana.pid"
   nohup "$KN_HOME/bin/kibana" >> "$KN_HOME/logs/stdout.log" 2>&1 &
   echo $! > "$KN_HOME/kibana.pid"
-else
-  echo "Kibana already running."
 fi
 `;
 }
@@ -698,7 +768,7 @@ fi
 
 export const model = {
   type: "@leeehinman/elastic-stack",
-  version: "2026.05.18.13",
+  version: "2026.05.19.3",
   globalArguments: GlobalArgsSchema,
   resources: {
     state: {
@@ -710,6 +780,18 @@ export const model = {
     credentials: {
       description: "Stack credentials (stored in vault via sensitive fields)",
       schema: CredentialsSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 10,
+    },
+    benchmarkResult: {
+      description: "Document ingestion benchmark result (EPS, min/max event.ingested)",
+      schema: BenchmarkResultSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 10,
+    },
+    runStartTime: {
+      description: "Wall-clock timestamp recorded just before elastic-agents are started",
+      schema: RunStartTimeSchema,
       lifetime: "infinite" as const,
       garbageCollection: 10,
     },
@@ -975,6 +1057,255 @@ done
 
         context.logger.info("Elastic Stack uninstalled from all hosts", {});
         return { dataHandles: [] };
+      },
+    },
+
+    deleteDataStream: {
+      description:
+        "Delete an Elasticsearch data stream (idempotent — 404 is treated as success). " +
+        "Use before a benchmark run to ensure only this run's documents are measured.",
+      arguments: z.object({
+        elasticsearchUrl: z.string().describe("Elasticsearch URL, e.g. https://192.168.1.101:9200"),
+        elasticPassword: z.string().meta({ sensitive: true }).describe(
+          "Password for the 'elastic' superuser",
+        ),
+        caCertB64: z.string().describe("Base64-encoded Elasticsearch HTTP CA certificate"),
+        dataStream: z.string().describe("Data stream name to delete, e.g. 'logs-apache.access-*'"),
+      }),
+      execute: async (
+        args: {
+          elasticsearchUrl: string;
+          elasticPassword: string;
+          caCertB64: string;
+          dataStream: string;
+        },
+        context: {
+          logger: { info: (msg: string, args: Record<string, unknown>) => void };
+        },
+      ) => {
+        const { elasticsearchUrl, elasticPassword, caCertB64, dataStream } = args;
+        context.logger.info("Deleting data stream {ds}", { ds: dataStream });
+        await withCaCert(caCertB64, async (caPath) => {
+          const resp = await esFetch(
+            elasticsearchUrl, `/_data_stream/${dataStream}`, elasticPassword, caPath,
+            undefined, "DELETE",
+          );
+          const errType = ((resp.error as Record<string, unknown>)?.type as string) ?? "";
+          if (errType === "resource_not_found_exception") {
+            context.logger.info("Data stream {ds} not found — nothing to delete.", { ds: dataStream });
+          } else if (resp.acknowledged !== true) {
+            throw new Error(`Unexpected response deleting data stream: ${JSON.stringify(resp)}`);
+          } else {
+            context.logger.info("Data stream {ds} deleted.", { ds: dataStream });
+          }
+        });
+        return { dataHandles: [] };
+      },
+    },
+
+    recordStartTime: {
+      description:
+        "Record the current wall-clock time as a runStartTime data artifact. " +
+        "Call this just before starting elastic-agents so computeBenchmarkStats can " +
+        "filter its Elasticsearch query to only this run's documents.",
+      arguments: z.object({}),
+      execute: async (
+        _args: Record<never, never>,
+        context: {
+          globalArgs: z.infer<typeof GlobalArgsSchema>;
+          logger: { info: (msg: string, args: Record<string, unknown>) => void };
+          writeResource: (spec: string, name: string, data: unknown) => Promise<unknown>;
+        },
+      ) => {
+        const epochMs = Date.now();
+        context.logger.info("Recording run start time: {t}", { t: new Date(epochMs).toISOString() });
+        const { name } = context.globalArgs;
+        const handle = await context.writeResource("runStartTime", `run-start-${name}`, { epochMs });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    computeBenchmarkStats: {
+      description:
+        "Poll Elasticsearch until at least minCount documents matching the given " +
+        "field/value exist in a data stream, then compute min/max event.ingested " +
+        "and events-per-second (EPS). Logs a summary and writes a benchmarkResult resource.",
+      arguments: z.object({
+        elasticsearchUrl: z.string().describe("Elasticsearch URL, e.g. https://192.168.1.101:9200"),
+        elasticPassword: z.string().meta({ sensitive: true }).describe(
+          "Password for the 'elastic' superuser",
+        ),
+        caCertB64: z.string().describe("Base64-encoded Elasticsearch HTTP CA certificate"),
+        dataStream: z.string().describe("Data stream pattern, e.g. 'logs-apache.access-*'"),
+        queryField: z.string().optional().describe(
+          "Document field to filter on (must be a keyword field). Omit to count all docs in the data stream.",
+        ),
+        queryValue: z.string().optional().describe("Exact value to match in queryField"),
+        minCount: z.number().int().default(3072).describe("Number of documents to wait for"),
+        timeoutSeconds: z.number().int().default(600).describe(
+          "Maximum seconds to wait before throwing a timeout error",
+        ),
+        pollIntervalSeconds: z.number().int().default(5).describe(
+          "Seconds between polling attempts",
+        ),
+        startTimeMs: z.number().int().default(0).describe(
+          "Epoch ms lower bound for event.ingested filter (0 = no filter). " +
+          "Pass the epochMs from recordStartTime to restrict stats to this run only.",
+        ),
+      }),
+      execute: async (
+        args: {
+          elasticsearchUrl: string;
+          elasticPassword: string;
+          caCertB64: string;
+          dataStream: string;
+          queryField?: string;
+          queryValue?: string;
+          minCount: number;
+          timeoutSeconds: number;
+          pollIntervalSeconds: number;
+          startTimeMs: number;
+        },
+        context: {
+          globalArgs: z.infer<typeof GlobalArgsSchema>;
+          logger: { info: (msg: string, args: Record<string, unknown>) => void };
+          writeResource: (spec: string, name: string, data: unknown) => Promise<unknown>;
+        },
+      ) => {
+        const {
+          elasticsearchUrl, elasticPassword, caCertB64,
+          dataStream, queryField, queryValue,
+          minCount, timeoutSeconds, pollIntervalSeconds, startTimeMs,
+        } = args;
+
+        const fieldFilter = queryField && queryValue
+          ? [{ term: { [queryField]: queryValue } }]
+          : [];
+        const timeFilter = startTimeMs > 0
+          ? [{ range: { "event.ingested": { gte: startTimeMs } } }]
+          : [];
+        const baseQuery = {
+          bool: {
+            filter: [
+              ...fieldFilter,
+              ...timeFilter,
+            ],
+          },
+        };
+
+        const countQuery = {
+          query: baseQuery,
+          size: 0,
+          track_total_hits: true,
+        };
+
+        const startAt = new Date();
+        context.logger.info(
+          "Starting poll: waiting for {min} docs in {ds}" +
+          (queryField ? " where {field}={val}" : ""),
+          { min: minCount, ds: dataStream, field: queryField ?? "", val: queryValue ?? "" },
+        );
+
+        const deadline = startAt.getTime() + timeoutSeconds * 1000;
+        let docCount = 0;
+
+        await withCaCert(caCertB64, async (caPath) => {
+          while (Date.now() < deadline) {
+            const resp = await esFetch(
+              elasticsearchUrl, `/${dataStream}/_search`, elasticPassword, caPath, countQuery,
+            );
+            const total = ((resp.hits as Record<string, unknown>)?.total as Record<string, unknown>);
+            docCount = typeof total?.value === "number" ? total.value : 0;
+            context.logger.info("Poll: {n}/{min} documents", { n: docCount, min: minCount });
+            if (docCount >= minCount) break;
+            await new Promise((r) => setTimeout(r, pollIntervalSeconds * 1000));
+          }
+        });
+
+        if (docCount < minCount) {
+          throw new Error(
+            `Timeout after ${timeoutSeconds}s: only ${docCount}/${minCount} documents found ` +
+            `in ${dataStream} where ${queryField}=${queryValue}`,
+          );
+        }
+
+        const stopAt = new Date();
+        context.logger.info(
+          "Found {n} docs. Wall time: {secs}s. Computing event.ingested stats...",
+          { n: docCount, secs: ((stopAt.getTime() - startAt.getTime()) / 1000).toFixed(1) },
+        );
+
+        // Aggregation for min/max event.ingested (same filter as count query)
+        const statsQuery = {
+          query: baseQuery,
+          size: 0,
+          aggs: {
+            min_ingested: { min: { field: "event.ingested" } },
+            max_ingested: { max: { field: "event.ingested" } },
+          },
+        };
+
+        let minIngestedMs = 0;
+        let maxIngestedMs = 0;
+
+        await withCaCert(caCertB64, async (caPath) => {
+          const resp = await esFetch(
+            elasticsearchUrl, `/${dataStream}/_search`, elasticPassword, caPath, statsQuery,
+          );
+          const aggs = resp.aggregations as Record<string, unknown>;
+          minIngestedMs = ((aggs?.min_ingested as Record<string, unknown>)?.value as number) ?? 0;
+          maxIngestedMs = ((aggs?.max_ingested as Record<string, unknown>)?.value as number) ?? 0;
+        });
+
+        const ingestDurationSeconds = maxIngestedMs > minIngestedMs
+          ? (maxIngestedMs - minIngestedMs) / 1000
+          : 0;
+        const eventsPerSecond = ingestDurationSeconds > 0
+          ? docCount / ingestDurationSeconds
+          : 0;
+        const wallDurationSeconds = (stopAt.getTime() - startAt.getTime()) / 1000;
+
+        const runStartAt = startTimeMs > 0 ? new Date(startTimeMs).toISOString() : undefined;
+
+        context.logger.info(
+          "=== Benchmark Results ===\n" +
+          "  Documents:          {docs}\n" +
+          (runStartAt ? "  Agents started:     {runStartAt}\n" : "") +
+          "  Start poll (wall):  {startAt}\n" +
+          "  Stop poll (wall):   {stopAt}\n" +
+          "  min event.ingested: {minI}\n" +
+          "  max event.ingested: {maxI}\n" +
+          "  Ingest duration:    {dur}s\n" +
+          "  Events per second:  {eps}",
+          {
+            docs: docCount,
+            runStartAt: runStartAt ?? "",
+            startAt: startAt.toISOString(),
+            stopAt: stopAt.toISOString(),
+            minI: new Date(minIngestedMs).toISOString(),
+            maxI: new Date(maxIngestedMs).toISOString(),
+            dur: ingestDurationSeconds.toFixed(3),
+            eps: eventsPerSecond.toFixed(2),
+          },
+        );
+
+        const { name } = context.globalArgs;
+        const handle = await context.writeResource("benchmarkResult", `bench-${name}`, {
+          dataStream,
+          logFilePath: queryValue ?? dataStream,
+          documentCount: docCount,
+          minIngestedMs,
+          maxIngestedMs,
+          ingestDurationSeconds,
+          eventsPerSecond,
+          wallDurationSeconds,
+          runStartAt,
+          startAt: startAt.toISOString(),
+          stopAt: stopAt.toISOString(),
+          ranAt: new Date().toISOString(),
+        });
+
+        return { dataHandles: [handle] };
       },
     },
   },
