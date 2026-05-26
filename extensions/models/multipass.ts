@@ -7,6 +7,9 @@ const GlobalArgsSchema = z.object({
   name: z.string().describe(
     "Name for the multipass instance. Must start with a letter and contain only letters, numbers, or hyphens.",
   ),
+  sshAuthorizedKeys: z.array(z.string()).optional().describe(
+    "SSH public keys to inject via cloud-init. Added to ubuntu's authorized_keys on first boot.",
+  ),
 });
 
 const InstanceSchema = z.object({
@@ -101,7 +104,7 @@ const DeleteArgsSchema = z.object({
 
 export const model = {
   type: "@leeehinman/multipass",
-  version: "2026.05.17.1",
+  version: "2026.05.20.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     instance: {
@@ -116,18 +119,35 @@ export const model = {
       description: "Create and start a new multipass VM instance",
       arguments: LaunchArgsSchema,
       execute: async (args, context) => {
-        const { name } = context.globalArgs;
+        const { name, sshAuthorizedKeys } = context.globalArgs;
         const typedArgs = LaunchArgsSchema.parse(args);
 
         const launchArgs = ["launch", "--name", name];
         if (typedArgs.cpus !== undefined) launchArgs.push("--cpus", String(typedArgs.cpus));
         if (typedArgs.memory) launchArgs.push("--memory", typedArgs.memory);
         if (typedArgs.disk) launchArgs.push("--disk", typedArgs.disk);
-        if (typedArgs.cloudInit) launchArgs.push("--cloud-init", typedArgs.cloudInit);
+
+        let tempCloudInit: string | undefined;
+        if (typedArgs.cloudInit) {
+          launchArgs.push("--cloud-init", typedArgs.cloudInit);
+        } else if (sshAuthorizedKeys?.length) {
+          const lines = ["#cloud-config", "ssh_authorized_keys:"];
+          for (const key of sshAuthorizedKeys) lines.push(`  - ${key}`);
+          tempCloudInit = await Deno.makeTempFile({ suffix: ".yaml" });
+          await Deno.writeTextFile(tempCloudInit, lines.join("\n") + "\n");
+          launchArgs.push("--cloud-init", tempCloudInit);
+        }
+
         if (typedArgs.image) launchArgs.push(typedArgs.image);
 
         context.logger.info("Launching multipass instance {name}", { name });
-        const { stderr, success } = await runMultipass(launchArgs);
+        let stderr: string;
+        let success: boolean;
+        try {
+          ({ stderr, success } = await runMultipass(launchArgs));
+        } finally {
+          if (tempCloudInit) await Deno.remove(tempCloudInit).catch(() => {});
+        }
 
         if (!success) {
           // Treat "already in use" as idempotent — sync and return existing state.

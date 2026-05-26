@@ -9,6 +9,8 @@ description: >
 repository: "https://github.com/leeehinman/pipette"
 models:
   - elastic-stack.ts
+  - gcp-vm.ts
+  - tcp-churn-test.ts
 platforms:
   - darwin-aarch64
   - darwin-x86_64

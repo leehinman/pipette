@@ -768,7 +768,7 @@ fi
 
 export const model = {
   type: "@leeehinman/elastic-stack",
-  version: "2026.05.19.3",
+  version: "2026.05.20.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     state: {
@@ -1049,7 +1049,7 @@ done
           [elasticsearchHost, "elasticsearch", "elasticsearch.pid"],
         ] as [string, string, string][]) {
           await sshScript(host, sshUser, sshKey, buildStopScript(installDir, svc, pid));
-          const { stderr, success } = await sshExec(host, sshUser, sshKey, `rm -rf "${installDir}"`);
+          const { stderr, success } = await sshExec(host, sshUser, sshKey, `sudo rm -rf "${installDir}"`);
           if (!success) {
             throw new Error(`Failed to remove ${installDir} on ${host}: ${stderr}`);
           }
