@@ -1,0 +1,24 @@
+{
+  "@magistr/libvirt": {
+    "version": "2026.05.20.1",
+    "pulledAt": "2026-05-26T15:05:56.474Z",
+    "files": [
+      ".swamp/pulled-extensions/@magistr/libvirt/models/libvirt_vm.ts",
+      ".swamp/pulled-extensions/@magistr/libvirt/models/libvirt_storage.ts",
+      ".swamp/pulled-extensions/@magistr/libvirt/models/libvirt_network.ts",
+      ".swamp/pulled-extensions/@magistr/libvirt/models/libvirt_host.ts",
+      ".swamp/pulled-extensions/@magistr/libvirt/models/lib/parse.ts",
+      ".swamp/pulled-extensions/@magistr/libvirt/models/lib/connection.ts",
+      ".swamp/bundles/6f03d945/libvirt_vm.js",
+      ".swamp/bundles/6f03d945/libvirt_storage.js",
+      ".swamp/bundles/6f03d945/libvirt_network.js",
+      ".swamp/bundles/6f03d945/libvirt_host.js",
+      ".swamp/pulled-extensions/@magistr/libvirt/files/README.md",
+      ".swamp/pulled-extensions/@magistr/libvirt/files/LICENSE.md",
+      ".swamp/pulled-extensions/@magistr/libvirt/manifest.yaml"
+    ],
+    "checksum": "3fba9d7384f57428b8d221c7c9c1b04571a6ae1d51de4c6b0cbe28849a973b4e",
+    "filesChecksum": "3c55b8c96f916bf665b92e16541d0368fbd34ab8218ee8924e9e28691b8e418e",
+    "serverUrl": "https://swamp-club.com"
+  }
+}
